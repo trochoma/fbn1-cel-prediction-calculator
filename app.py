@@ -1,303 +1,167 @@
 # -*- coding: utf-8 -*-
-
 from pathlib import Path
+import __main__
 
 import joblib
+import numpy as np
 import pandas as pd
 import streamlit as st
 
+from model_compat import TopKGradientBoostingSelector
 
-# =============================================================================
-# Page configuration
-# =============================================================================
+# The serialized model refers to this custom class as __main__.TopKGradientBoostingSelector.
+__main__.TopKGradientBoostingSelector = TopKGradientBoostingSelector
 
 st.set_page_config(
-    page_title="FBN1-positive CEL Prediction Calculator",
+    page_title="FBN1-related CEL Screening Calculator",
     page_icon="🧬",
-    layout="centered"
+    layout="centered",
 )
-
-
-# =============================================================================
-# Page styling
-# =============================================================================
 
 st.markdown(
     """
     <style>
-    /* Overall page width and spacing */
-    .block-container {
-        max-width: 860px;
-        padding-top: 2.2rem;
-        padding-bottom: 2rem;
-    }
-
-    /* Main title */
-    .title-text {
-        text-align: center;
-        font-size: 2.1rem;
-        font-weight: 700;
-        margin-bottom: 0.25rem;
-        color: #1f2937;
-    }
-
-    /* Subtitle */
-    .subtitle-text {
-        text-align: center;
-        color: #5f6b7a;
-        font-size: 1.02rem;
-        margin-bottom: 1.2rem;
-    }
-
-    /* Section title */
-    h3 {
-        text-align: center;
-        margin-top: 1.4rem;
-        margin-bottom: 1rem;
-    }
-
-    /* Alert box text */
-    div[data-testid="stAlert"] {
-        text-align: center;
-    }
-
-    /* Button */
-    div.stButton > button:first-child {
-        width: 100%;
-        border-radius: 10px;
-        height: 2.8rem;
-        font-weight: 600;
-        font-size: 1rem;
-    }
-
-    /* Result card */
-    .result-card {
-        text-align: center;
-        background-color: #f7f9fc;
-        padding: 1.35rem 1.45rem;
-        border-radius: 14px;
-        border: 1px solid #e1e7ef;
-        margin-top: 1.2rem;
-        margin-bottom: 0.8rem;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
-    }
-
-    .result-label {
-        font-size: 1.02rem;
-        color: #4b5563;
-        margin-bottom: 0.35rem;
-    }
-
-    .result-value {
-        font-size: 2.9rem;
-        font-weight: 700;
-        color: #1f2937;
-        margin-bottom: 0.25rem;
-    }
-
-    .threshold-text {
-        font-size: 0.9rem;
-        color: #6b7280;
-    }
-
-    .small-note {
-        text-align: center;
-        color: #6b7280;
-        font-size: 0.88rem;
-        line-height: 1.45;
-        margin-top: 0.6rem;
-        margin-bottom: 0.6rem;
-    }
-
-    .footer-note {
-        text-align: center;
-        color: #6b7280;
-        font-size: 0.86rem;
-        line-height: 1.45;
-        margin-top: 0.8rem;
-    }
+    .block-container { max-width: 900px; padding-top: 1.8rem; padding-bottom: 2rem; }
+    .title-text { text-align: center; font-size: 1.9rem; font-weight: 700; margin-bottom: .3rem; }
+    .subtitle-text { text-align: center; color: #64748b; font-size: .98rem; margin-bottom: 1rem; }
+    .score-card { border: 1px solid #dbe4ee; border-radius: 14px; padding: 1.2rem; text-align: center; background: #f8fafc; margin: .5rem 0 1rem; }
+    .score-label { color: #475569; font-size: .95rem; margin-bottom: .25rem; }
+    .score-value { color: #0f172a; font-size: 2.6rem; line-height: 1.2; font-weight: 750; }
+    .score-foot { color: #64748b; font-size: .86rem; margin-top: .45rem; }
+    div.stButton > button { width: 100%; min-height: 2.8rem; font-weight: 600; border-radius: 9px; }
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
-
-
-# =============================================================================
-# Load model bundle
-# =============================================================================
 
 @st.cache_resource
 def load_bundle():
-    bundle_path = Path("fbn1_cel_lgbm_top5_deployment_full_bundle.joblib")
-    if not bundle_path.exists():
-        st.error(
-            "Model bundle file was not found. Please make sure "
-            "`fbn1_cel_lgbm_top5_deployment_full_bundle.joblib` is in the same folder as app.py."
-        )
+    path = Path(__file__).resolve().parent / "locked_FBN1_XGBoost_pipeline.joblib"
+    if not path.exists():
+        st.error(f"Model file not found: {path.name}. Keep it in the same folder as app.py.")
         st.stop()
-    return joblib.load(bundle_path)
-
+    return joblib.load(path)
 
 bundle = load_bundle()
+pipeline = bundle["pipeline"]
+candidate_features = list(bundle["candidate_features"])
+selected_features = list(bundle["selected_features"])
+threshold = float(bundle["operating_threshold"])
+selected_k = int(bundle.get("selected_k", len(selected_features)))
+model_family = bundle.get("model_family", "XGBoost")
 
-model = bundle["model"]
-imputer = bundle["imputer"]
-scaler = bundle["scaler"]
-features = bundle["features"]
-threshold = bundle.get("threshold", 0.5)
+# Concise adult reference guides for orientation only. Actual lab reference
+# intervals and units may vary by laboratory, method, age, and sex.
+FEATURE_INFO = {
+    "urea": ("Urea", "mmol/L · adult guide ~2.5–7.1"),
+    "inr": ("INR", "unitless · typical guide ~0.8–1.2"),
+    "triglycerides": ("Triglycerides", "mmol/L · fasting desirable <1.7"),
+    "mpv": ("MPV", "fL · approximate guide 9–13"),
+    "plateletcrit": ("Plateletcrit", "% · approximate guide 0.11–0.28"),
+    "mchc": ("MCHC", "g/L · approximate guide 316–354"),
+    "neutrophil_abs": ("Neutrophil count", "×10⁹/L · approximate guide 1.8–6.3"),
+    "alt": ("ALT", "U/L · adult guide often <35–50"),
+    "albumin": ("Albumin", "g/L · approximate guide 35–50"),
+    "mch": ("MCH", "pg · approximate guide 27–34"),
+    "glucose": ("Glucose", "mmol/L · fasting guide ~4.1–5.9"),
+    "wbc_count": ("WBC count", "×10⁹/L · approximate guide 3.5–9.5"),
+    "calcium": ("Calcium", "mmol/L · approximate guide 2.10–2.55"),
+    "prothrombin_time": ("Prothrombin time", "s · approximate guide 8.8–13.8"),
+    "total_protein": ("Total protein", "g/L · approximate guide 63–82"),
+    "hematocrit": ("Hematocrit", "% · enter e.g. 48.6, not 0.486"),
+    "monocyte_pct": ("Monocytes (%)", "% · approximate guide 3–10"),
+    "basophil_abs": ("Basophil count", "×10⁹/L · approximate guide 0–0.06"),
+    "basophil_pct": ("Basophils (%)", "% · approximate guide 0–1"),
+    "fibrinogen": ("Fibrinogen", "g/L · approximate guide 2–5"),
+    "platelet_count": ("Platelet count", "×10⁹/L · approximate guide 125–350"),
+    "rbc_count": ("RBC count", "×10¹²/L · adult guide varies by sex, ~3.8–5.8"),
+    "neutrophil_pct": ("Neutrophils (%)", "% · approximate guide 40–75"),
+}
 
-
-# =============================================================================
-# Header
-# =============================================================================
-
+st.markdown('<div class="title-text">FBN1-related CEL Screening Calculator</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="title-text">FBN1-positive CEL Prediction Calculator</div>',
-    unsafe_allow_html=True
+    f'<div class="subtitle-text">Locked {model_family} model · {selected_k} laboratory features</div>',
+    unsafe_allow_html=True,
 )
-
-st.markdown(
-    '<div class="subtitle-text">'
-    'A research prototype based on a five-feature LightGBM model using routine blood test parameters.'
-    '</div>',
-    unsafe_allow_html=True
-)
-
 st.info(
-    "This tool is intended for research and clinical decision-support exploration only. "
-    "It does not replace genetic testing or professional clinical judgment."
+    "Research use only. This model score does not establish a genetic diagnosis "
+    "and does not replace genetic testing or clinical judgment."
 )
 
+st.markdown("### Laboratory inputs")
+st.caption(
+    "Enter values in the units shown. Reference intervals are brief adult guides only; "
+    "use the units and ranges on the original laboratory report. Leave unavailable values blank."
+)
 
-# =============================================================================
-# Input section
-# =============================================================================
+input_values = {}
+invalid_fields = []
+left, right = st.columns(2)
 
-st.markdown("### Input laboratory parameters")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    aptt = st.number_input(
-        "APTT, activated partial thromboplastin time (s)",
-        min_value=0.0,
-        max_value=120.0,
-        value=32.5,
-        step=0.1
+for i, feature in enumerate(selected_features):
+    label, hint = FEATURE_INFO.get(
+        feature, (feature.replace("_", " ").title(), "Use the unit shown on the laboratory report")
     )
+    col = left if i % 2 == 0 else right
+    with col:
+        raw = st.text_input(
+            label,
+            value="",
+            placeholder=hint,
+            key=f"input_{feature}",
+            help=f"Approximate guide: {hint}. This is not a diagnostic reference interval.",
+        ).strip()
+        if raw == "":
+            input_values[feature] = np.nan
+        else:
+            try:
+                input_values[feature] = float(raw)
+            except ValueError:
+                input_values[feature] = np.nan
+                invalid_fields.append(label)
 
-    pdw = st.number_input(
-        "PDW, platelet distribution width",
-        min_value=0.0,
-        max_value=100.0,
-        value=12.4,
-        step=0.1
-    )
+if invalid_fields:
+    st.warning("Please enter numeric values or leave blank: " + ", ".join(invalid_fields))
 
-    platelet_count = st.number_input(
-        "Platelet count, PLT (10⁹/L)",
-        min_value=0.0,
-        max_value=1000.0,
-        value=260.0,
-        step=1.0
-    )
-
-with col2:
-    thrombin_time = st.number_input(
-        "Thrombin time, TT (s)",
-        min_value=0.0,
-        max_value=120.0,
-        value=16.8,
-        step=0.1
-    )
-
-    triglycerides = st.number_input(
-        "Triglycerides, TG (mmol/L)",
-        min_value=0.0,
-        max_value=30.0,
-        value=1.15,
-        step=0.01
-    )
-
-
-# =============================================================================
-# Prediction
-# =============================================================================
-
-if st.button("Predict probability", type="primary"):
-
-    raw_input = pd.DataFrame([{
-        "aptt": aptt,
-        "thrombin_time": thrombin_time,
-        "pdw": pdw,
-        "triglycerides": triglycerides,
-        "platelet_count": platelet_count
-    }])
-
-    # Keep the exact feature order used by the saved model bundle
-    raw_input = raw_input[features]
-
-    X_imp = pd.DataFrame(
-        imputer.transform(raw_input),
-        columns=features
-    )
-
-    X_scaled = pd.DataFrame(
-        scaler.transform(X_imp),
-        columns=features
-    )
-
-    probability = model.predict_proba(X_scaled)[0, 1]
-    predicted_class = int(probability >= threshold)
-
-    st.markdown(
-        f"""
-        <div class="result-card">
-            <div class="result-label">
-                Model-predicted probability of FBN1-positive CEL
-            </div>
-            <div class="result-value">
-                {probability:.1%}
-            </div>
-            <div class="threshold-text">
-                Model decision threshold: {threshold:.3f}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    if predicted_class == 1:
-        st.warning(
-            "Model classification: higher predicted probability of FBN1-positive CEL."
-        )
+if st.button("Calculate screening score", type="primary"):
+    if invalid_fields:
+        st.error("Correct the non-numeric inputs before calculating.")
     else:
-        st.success(
-            "Model classification: lower predicted probability of FBN1-positive CEL."
+        # The saved pipeline expects all candidate columns in the original order.
+        # Only the selected features are requested from the user; other candidates
+        # are left missing and handled by the pipeline's fitted imputer.
+        raw_input = pd.DataFrame(
+            [{feature: np.nan for feature in candidate_features}],
+            columns=candidate_features,
+        )
+        for feature, value in input_values.items():
+            raw_input.loc[0, feature] = value
+
+        probability = float(pipeline.predict_proba(raw_input[candidate_features])[0, 1])
+        predicted_class = int(probability >= threshold)
+
+        st.markdown("### Prediction result")
+        st.metric(
+            label="Model-predicted screening score",
+            value=f"{probability:.1%}",
+        )
+        st.caption(f"Decision threshold: {threshold:.3f}")
+
+        if predicted_class == 1:
+            st.warning("Model classification: screen-positive.")
+        else:
+            st.success("Model classification: screen-negative.")
+
+        st.caption(
+            "This is a model-derived score from a matched case-control research cohort, "
+            "not an absolute population risk or a definitive FBN1 diagnosis."
         )
 
-    st.markdown(
-        """
-        <div class="small-note">
-        This value is a model-derived prediction score and should not be interpreted as a definitive genetic diagnosis.
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-# =============================================================================
-# Footer
-# =============================================================================
+with st.expander("Model details"):
+    st.write(f"Model: {model_family}")
+    st.write(f"Selected features: {selected_k}")
+    st.write(f"Decision threshold: {threshold:.3f}")
+    st.caption("Reference intervals are for input orientation only and may differ from your laboratory's ranges.")
 
 st.markdown("---")
-
-st.markdown(
-    """
-    <div class="footer-note">
-    Required inputs: APTT, thrombin time, PDW, triglycerides, and platelet count. 
-    The prediction is generated by a saved LightGBM model trained for research purposes.
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+st.caption("Research prototype · Confirm all units against the original laboratory report.")
